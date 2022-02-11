@@ -1,15 +1,16 @@
 package main
 
 import (
-	"time"
 )
 
 func main() {
-	chrome, err := NewChrome(false)
+	browser, err := NewBrowser(false)
 	if err != nil {
 		PanicLog(err)
 	}
-	defer chrome.Close()
+	defer browser.Close()
 
-	time.Sleep(15 * time.Second)
+	for job := range LinkedIn(browser, nil) {
+		InfoLog("%+v", job)
+	}
 }
