@@ -1,0 +1,13 @@
+TODO Consider adding time limits to main.go and/or scraper implementations
+
+TODO Collect and record scraping stats: execution time, internal iteration count, seen entries count, unparsable entries count, etc
+     Implies recording data in main.go and the scraper itself
+
+TODO Implement scoring: implies Score, MatchedPhrases and TokenTfIdf attributes
+     Use the original Lisp spelunker implementation as a guide
+
+TODO Move shared structs into a single file
+     Ie Job is used by LinkedIn but would also be used by other job board scrapers
+
+TODO Consider using vendoring to break up the main package into multiple packages (directories)
+     Especially relevant if a large number of sources are implemented

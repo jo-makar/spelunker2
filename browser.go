@@ -186,7 +186,7 @@ func NewBrowser(incognito bool) (*Browser, error) {
 	case <- browser.done:
 		return nil, errors.New("browser exited early")
 	case devtoolsUrl = <- devtools:
-		InfoLog("devtools url: %s", devtoolsUrl)
+		DebugLog("devtools url: %s", devtoolsUrl)
 	case <- time.After(15 * time.Second):
 		browser.Close()
 		return nil, errors.New("deadline reached looking for devtools url")
@@ -242,7 +242,7 @@ func NewBrowser(incognito bool) (*Browser, error) {
 		return nil, fmt.Errorf("unexpected entry count (%d)", len(entries))
 	}
 	debuggerUrl := entries[0].DebuggerUrl
-	InfoLog("debugger url: %s", debuggerUrl)
+	DebugLog("debugger url: %s", debuggerUrl)
 
 	browser.ws, err = websocket.Dial(debuggerUrl, "", "http://127.0.0.1/")
 	if err != nil {

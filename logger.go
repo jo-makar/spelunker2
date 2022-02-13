@@ -36,7 +36,7 @@ type logger struct {
 }
 
 var defaultLogger = logger{
-	  Level: debugLevel,
+	  Level: infoLevel,
 	Writers: []io.Writer{os.Stderr},
 }
 
@@ -47,7 +47,7 @@ func (l *logger) log(level int, format string, values ...interface{}) string {
 	var builder strings.Builder
 
 	now := time.Now()
-	builder.WriteString(now.Format("2006/01/02 15:04:05") + fmt.Sprintf(".%03d", now.Nanosecond() / 1000000))
+	builder.WriteString(now.Format("2006-01-02 15:04:05") + fmt.Sprintf(".%03d", now.Nanosecond() / 1000000))
 
 	builder.WriteString(" " + logLevels[level])
 

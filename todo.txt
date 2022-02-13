@@ -1,2 +1,0 @@
-Consider using vendoring to break up the main package into multiple packages (directories)
-Especially relevant if a large number of sources are implemented
