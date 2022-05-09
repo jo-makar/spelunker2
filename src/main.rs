@@ -7,7 +7,7 @@ fn main() {
     env_logger::init();
 
     let browser = browser::Browser::new().unwrap();
-    println!("{}", browser); // FIXME remove
 
+    // FIXME STOPPED
     thread::sleep(time::Duration::from_secs(5));
 }
