@@ -16,7 +16,7 @@ pub struct Browser {
 impl Browser {
     pub fn new() -> Result<Self, Box<dyn error::Error>> {
         let mut cmd = process::Command::new("/opt/google/chrome/chrome");
-        cmd.args(&["-headless", "-remote-debugging-port=0"]);
+        cmd.args(&["--headless", "--remote-debugging-port=0"]);
 
         match env::var("HOME") {
             Ok(h) => { cmd.arg(format!("--user-data-dir={}/.config/google-chrome", h)); },
@@ -27,7 +27,7 @@ impl Browser {
         }
 
         cmd.stdin(process::Stdio::null())
-           .stdout(process::Stdio::piped())
+           .stdout(process::Stdio::null())
            .stderr(process::Stdio::piped());
 
         let mut child = match cmd.spawn() {
@@ -44,7 +44,10 @@ impl Browser {
         // However (at least currently) only BufReader supports into_inner() to unwrap the underlying reader.
         let mut stderr_reader = io::BufReader::new(timeout_readwrite::TimeoutReader::new(stderr, time::Duration::from_secs(1)));
 
+        let mut port: Option<u16> = None;
         {
+            let re = regex::Regex::new(r"^DevTools listening on (ws://127.0.0.1:(\d+)/devtools/browser/[a-f0-9-]+)$").unwrap();
+
             for _ in 0..15 {
                 let mut line = String::new();
                 match stderr_reader.read_line(&mut line) {
@@ -54,7 +57,19 @@ impl Browser {
                         }
                         if !line.is_empty() {
                             log::info!("stderr: {}", line);
-                            // FIXME STOPPED Check if line is the websocket url, if so extract it and break
+
+                            if let Some(c) = re.captures(&line) {
+                                log::info!("websocket url: {}", c.get(1).unwrap().as_str());
+
+                                let s = c.get(2).unwrap().as_str();
+                                match s.parse::<u16>() {
+                                    Ok(p) => {
+                                        port = Some(p);
+                                        break;
+                                    },
+                                    Err(e) => log::error!("error parsing port {}: {}", s, e)
+                                }
+                            }
                         }
                     },
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {},
@@ -62,6 +77,51 @@ impl Browser {
                         log::error!("error reading stderr: {}", e);
                         break;
                     }
+                }
+            }
+
+            if let None = port {
+                let s = "websocket url not found";
+                log::error!("{}", s);
+                return Err(string_error::static_err(s));
+            }
+        }
+        let port = port.unwrap();
+
+        let debugger_url: String;
+        {
+            #[derive(serde::Deserialize, Debug)]
+            struct Config {
+                #[serde(rename = "webSocketDebuggerUrl")]
+                debugger_url: String,
+            }
+
+            match reqwest::blocking::get(format!("http://127.0.0.1:{}/json", port)) {
+                Ok(r) if r.status() == reqwest::StatusCode::OK => {
+                    match r.json::<Vec<Config>>() {
+                        Ok(c) if c.len() == 1 => {
+                            debugger_url = c[0].debugger_url.clone();
+                            log::info!("debugger url: {}", debugger_url);
+                        },
+                        Ok(c) => {
+                            let s = format!("unexpected json url response config count ({})", c.len());
+                            log::error!("{}", s);
+                            return Err(string_error::into_err(s));
+                        },
+                        Err(e) => {
+                            log::error!("error parsing json url response: {}", e);
+                            return Err(Box::new(e));
+                        }
+                    }
+                },
+                Ok(r) => {
+                    let s = format!("{} status code from json url", r.status());
+                    log::error!("{}", s);
+                    return Err(string_error::into_err(s));
+                },
+                Err(e) => {
+                    log::error!("error accessing json url: {}", e);
+                    return Err(Box::new(e));
                 }
             }
         }
@@ -83,7 +143,9 @@ impl Browser {
             }
         });
 
-        // FIXME Read stdout like stderr but also setup a channel to report results
+        // FIXME STOPPED Open a websocket connection to the debugger url
+        //               Then define a thread to read messages into a circular buffer
+        //               Unlike the stderr thread will need to be joined when Browser is dropped
 
         Ok(Self {
             child: child,
@@ -102,8 +164,7 @@ impl Drop for Browser {
         }
         log::warn!("deadline reached waiting for Browser.close");
 
-        match signal::kill(unistd::Pid::from_raw(self.child.id() as i32),
-                           signal::Signal::SIGTERM) {
+        match signal::kill(unistd::Pid::from_raw(self.child.id() as i32), signal::Signal::SIGTERM) {
             Ok(()) => {
                 for _ in 0..15 {
                     match self.child.try_wait() {
