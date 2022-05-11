@@ -5,6 +5,10 @@ use regex::Regex;
 
 use reqwest::{self, StatusCode};
 
+use serde::{Deserialize, Serialize};
+
+use serde_json::{self, Map, Number, Value};
+
 use std::env;
 use std::error::Error;
 use std::fmt::{self, Debug, Formatter};
@@ -17,13 +21,31 @@ use std::time::Duration;
 
 use timeout_readwrite::TimeoutReader;
 
-use tungstenite::{self, protocol::WebSocket};
+use tungstenite::{self, protocol::{self, WebSocket}};
 
 use url::Url;
 
+struct BrowserShared {
+    websocket: WebSocket<TcpStream>,
+}
+
 pub struct Browser {
     child: Child,
-    websocket: Arc<Mutex<WebSocket<TcpStream>>>,
+    shared: Arc<Mutex<BrowserShared>>,
+    request_id: u64,
+}
+
+struct Response {
+    // FIXME
+}
+
+struct Event {
+    // FIXME
+}
+
+enum Message {
+    Response(Response),
+    Event(Event),
 }
 
 impl Browser {
@@ -104,7 +126,7 @@ impl Browser {
 
         let debugger_url: String;
         {
-            #[derive(serde::Deserialize, Debug)]
+            #[derive(Deserialize, Debug)]
             struct Config {
                 #[serde(rename = "webSocketDebuggerUrl")]
                 debugger_url: String,
@@ -207,43 +229,103 @@ impl Browser {
             return Err(Box::new(e));
         }
 
-        let websocket = Arc::new(Mutex::new(websocket));
-        let websocket2 = websocket.clone();
-
-        thread::spawn(move || {
-            loop {
-                match websocket2.lock() {
-                    Ok(ref mut w) => {
-                        match w.read_message() {
-                            Ok(m) => {
-                                // FIXME Store messages/events enum in a circular buffer
-                                log::info!("websocket message: {}", m);
-                            },
-                            Err(tungstenite::error::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {},
-                            Err(e) => {
-                                log::error!("websocket error: {}", e);
-                                break;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        log::error!("websocket poisoned mutex: {}", e);
-                        break;
-                    }
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        });
-
-        Ok(Self {
-            child: child,
+        let shared = Arc::new(Mutex::new(BrowserShared{
             websocket: websocket,
-        })
+        }));
+
+        {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                loop {
+                    match shared.lock() {
+                        Ok(ref mut s) => {
+                            match s.websocket.read_message() {
+                                Ok(m) => {
+                                    // FIXME Store messages (responses/events enum) in a circular buffer
+                                    log::info!("websocket message: {}", m);
+                                },
+                                Err(tungstenite::error::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {},
+                                Err(e) => {
+                                    log::error!("websocket error: {}", e);
+                                    break;
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("poisoned mutex: {}", e);
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            });
+        }
+
+        let mut retval = Self {
+            child: child,
+            shared: shared,
+            request_id: 0,
+        };
+
+        // FIXME STOPPED
+        {
+            let mut params: Map<String, Value> = Map::new();
+            params.insert("expression".to_string(), Value::String("navigator.userAgent".to_string()));
+            let _ = retval.execute("Runtime.evaluate", Some(params));
+        }
+
+        Ok(retval)
     }
 
-    // FIXME STOPPED Use old Go code as model
-    //fn execute(&mut self, method: &str) -> Result<Message> {
-    //}
+    // FIXME Include timeout here, including forever and immediate return
+    fn execute(&mut self, method: &str, param: Option<Map<String, Value>>) -> Result<Response, Box<dyn Error>> {
+        {
+            #[derive(Serialize)]
+            struct Request {
+                id: Number,
+                method: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                param: Option<Map<String, Value>>,
+            }
+
+            let request = Request{
+                id: Number::from(self.request_id),
+                method: method.to_string(),
+                param: param,
+            };
+            self.request_id += 1;
+
+            let request_string = match serde_json::to_string(&request) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("json serialization error: {}", e);
+                    return Err(Box::new(e));
+                }
+            };
+            log::trace!(">>> {}", request_string);
+
+            match self.shared.clone().lock() {
+                Ok(mut s) => {
+                    match s.send_request(&request_string) {
+                        Ok(_) => {},
+                        Err(e) => {
+                            log::error!("error sending message: {}", e);
+                            return Err(e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    let s = format!("poisoned mutex: {}", e);
+                    log::error!("{}", s);
+                    return Err(string_error::into_err(s));
+                }
+            }
+        }
+
+        // FIXME STOPPED Loop for optional timeout while thread collects potential responses
+
+        Ok(Response {})
+    }
 }
 
 impl Drop for Browser {
@@ -291,6 +373,15 @@ impl Drop for Browser {
 impl Debug for Browser {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "Browser {{ pid: {} }}", self.child.id())
+    }
+}
+
+impl BrowserShared {
+    fn send_request(&mut self, request: &str) -> Result<(), Box<dyn Error>> {
+        match self.websocket.write_message(protocol::Message::Text(request.to_string())) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Box::new(e))
+        }
     }
 }
 

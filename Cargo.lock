@@ -855,6 +855,7 @@ dependencies = [
  "regex",
  "reqwest",
  "serde",
+ "serde_json",
  "string-error",
  "timeout-readwrite",
  "tungstenite",
