@@ -1,21 +1,34 @@
-use nix::sys::signal;
-use nix::unistd;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+
+use regex::Regex;
+
+use reqwest::{self, StatusCode};
 
 use std::env;
-use std::error;
-use std::fmt;
-use std::io::{self, BufRead};
-use std::process;
+use std::error::Error;
+use std::fmt::{self, Debug, Formatter};
+use std::io::{self, BufRead, BufReader};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time;
+use std::time::Duration;
+
+use timeout_readwrite::TimeoutReader;
+
+use tungstenite::{self, protocol::WebSocket};
+
+use url::Url;
 
 pub struct Browser {
-    child: process::Child,
+    child: Child,
+    websocket: Arc<Mutex<WebSocket<TcpStream>>>,
 }
 
 impl Browser {
-    pub fn new() -> Result<Self, Box<dyn error::Error>> {
-        let mut cmd = process::Command::new("/opt/google/chrome/chrome");
+    pub fn new() -> Result<Self, Box<dyn Error>> {
+        let mut cmd = Command::new("/opt/google/chrome/chrome");
         cmd.args(&["--headless", "--remote-debugging-port=0"]);
 
         match env::var("HOME") {
@@ -26,9 +39,9 @@ impl Browser {
             }
         }
 
-        cmd.stdin(process::Stdio::null())
-           .stdout(process::Stdio::null())
-           .stderr(process::Stdio::piped());
+        cmd.stdin(Stdio::null())
+           .stdout(Stdio::null())
+           .stderr(Stdio::piped());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -42,11 +55,11 @@ impl Browser {
 
         // Ideally would unwrap stderr from the BufReader and TimeoutReader for later use in the thread below.
         // However (at least currently) only BufReader supports into_inner() to unwrap the underlying reader.
-        let mut stderr_reader = io::BufReader::new(timeout_readwrite::TimeoutReader::new(stderr, time::Duration::from_secs(1)));
+        let mut stderr_reader = BufReader::new(TimeoutReader::new(stderr, Duration::from_secs(1)));
 
         let mut port: Option<u16> = None;
         {
-            let re = regex::Regex::new(r"^DevTools listening on (ws://127.0.0.1:(\d+)/devtools/browser/[a-f0-9-]+)$").unwrap();
+            let re = Regex::new(r"^DevTools listening on (ws://127.0.0.1:(\d+)/devtools/browser/[a-f0-9-]+)$").unwrap();
 
             for _ in 0..15 {
                 let mut line = String::new();
@@ -83,6 +96,7 @@ impl Browser {
             if let None = port {
                 let s = "websocket url not found";
                 log::error!("{}", s);
+                let _ = child.kill();
                 return Err(string_error::static_err(s));
             }
         }
@@ -97,7 +111,7 @@ impl Browser {
             }
 
             match reqwest::blocking::get(format!("http://127.0.0.1:{}/json", port)) {
-                Ok(r) if r.status() == reqwest::StatusCode::OK => {
+                Ok(r) if r.status() == StatusCode::OK => {
                     match r.json::<Vec<Config>>() {
                         Ok(c) if c.len() == 1 => {
                             debugger_url = c[0].debugger_url.clone();
@@ -106,21 +120,25 @@ impl Browser {
                         Ok(c) => {
                             let s = format!("unexpected json url response config count ({})", c.len());
                             log::error!("{}", s);
+                            let _ = child.kill();
                             return Err(string_error::into_err(s));
                         },
                         Err(e) => {
                             log::error!("error parsing json url response: {}", e);
+                            let _ = child.kill();
                             return Err(Box::new(e));
                         }
                     }
                 },
                 Ok(r) => {
-                    let s = format!("{} status code from json url", r.status());
+                    let s = format!("{} status from json url", r.status());
                     log::error!("{}", s);
+                    let _ = child.kill();
                     return Err(string_error::into_err(s));
                 },
                 Err(e) => {
                     log::error!("error accessing json url: {}", e);
+                    let _ = child.kill();
                     return Err(Box::new(e));
                 }
             }
@@ -143,14 +161,89 @@ impl Browser {
             }
         });
 
-        // FIXME STOPPED Open a websocket connection to the debugger url
-        //               Then define a thread to read messages into a circular buffer
-        //               Unlike the stderr thread will need to be joined when Browser is dropped
+        // Providing a non-blocking stream so that websocket will support non-blocking reads.
+        // Ref: https://docs.rs/tungstenite/0.17.2/tungstenite/client/fn.client.html
+        //      https://doc.rust-lang.org/stable/std/net/struct.TcpStream.html#method.set_nonblocking
+        let stream: TcpStream;
+        {
+            let port = match Url::parse(&debugger_url) {
+                Ok(u) => u.port().unwrap_or(80),
+                Err(e) => {
+                    log::error!("error parsing debbuger url: {}", e);
+                    let _ = child.kill();
+                    return Err(Box::new(e));
+                }
+            };
+
+            stream = match TcpStream::connect(format!("127.0.0.1:{}", port)) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("error connecting to debbuger url: {}", e);
+                    let _ = child.kill();
+                    return Err(Box::new(e));
+                }
+            };
+        }
+
+        let mut websocket: WebSocket<TcpStream>;
+        match tungstenite::client::client(debugger_url, stream) {
+            Ok((w, r)) if r.status() == StatusCode::SWITCHING_PROTOCOLS => websocket = w,
+            Ok((_, r)) => {
+                let s = format!("{} status from debugger url", r.status());
+                log::error!("{}", s);
+                let _ = child.kill();
+                return Err(string_error::into_err(s));
+            },
+            Err(e) => {
+                log::error!("error connecting to websocket: {}", e);
+                let _ = child.kill();
+                return Err(Box::new(e));
+            }
+        }
+
+        if let Err(e) = websocket.get_mut().set_nonblocking(true) {
+            log::error!("set_nonblocking error: {}", e);
+            let _ = child.kill();
+            return Err(Box::new(e));
+        }
+
+        let websocket = Arc::new(Mutex::new(websocket));
+        let websocket2 = websocket.clone();
+
+        thread::spawn(move || {
+            loop {
+                match websocket2.lock() {
+                    Ok(ref mut w) => {
+                        match w.read_message() {
+                            Ok(m) => {
+                                // FIXME Store messages/events enum in a circular buffer
+                                log::info!("websocket message: {}", m);
+                            },
+                            Err(tungstenite::error::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {},
+                            Err(e) => {
+                                log::error!("websocket error: {}", e);
+                                break;
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("websocket poisoned mutex: {}", e);
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
 
         Ok(Self {
             child: child,
+            websocket: websocket,
         })
     }
+
+    // FIXME STOPPED Use old Go code as model
+    //fn execute(&mut self, method: &str) -> Result<Message> {
+    //}
 }
 
 impl Drop for Browser {
@@ -164,7 +257,7 @@ impl Drop for Browser {
         }
         log::warn!("deadline reached waiting for Browser.close");
 
-        match signal::kill(unistd::Pid::from_raw(self.child.id() as i32), signal::Signal::SIGTERM) {
+        match kill(Pid::from_raw(self.child.id() as i32), Signal::SIGTERM) {
             Ok(()) => {
                 for _ in 0..15 {
                     match self.child.try_wait() {
@@ -174,11 +267,11 @@ impl Drop for Browser {
                         },
                         Ok(None) => {},
                         Err(e) => {
-                            log::error!("try_wait error: {}", e);
+                            log::error!("process try_wait error: {}", e);
                             break;
                         }
                     }
-                    thread::sleep(time::Duration::from_secs(1));
+                    thread::sleep(Duration::from_secs(1));
                 }
             },
             Err(e) => log::error!("error sending SIGTERM: {}", e)
@@ -190,13 +283,15 @@ impl Drop for Browser {
         log::warn!("deadline reached waiting for SIGTERM");
 
         if let Err(e) = self.child.kill() {
-            log::error!("kill error: {}", e);
+            log::error!("process kill error: {}", e);
         }
     }
 }
 
-impl fmt::Debug for Browser {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for Browser {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "Browser {{ pid: {} }}", self.child.id())
     }
 }
+
+// TODO Add support for thread-safe, simultaneous sessions

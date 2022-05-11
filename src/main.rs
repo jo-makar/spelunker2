@@ -1,13 +1,15 @@
 mod browser;
 
+use browser::Browser;
+
 use std::thread;
-use std::time;
+use std::time::Duration;
 
 fn main() {
     env_logger::init();
 
-    let browser = browser::Browser::new().unwrap();
+    let browser = Browser::new().unwrap();
 
     // FIXME STOPPED
-    thread::sleep(time::Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(5));
 }
