@@ -17,7 +17,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use timeout_readwrite::TimeoutReader;
 
@@ -25,27 +25,47 @@ use tungstenite::{self, protocol::{self, WebSocket}};
 
 use url::Url;
 
+#[derive(Clone, Debug, Deserialize)]
+struct ResponseResultResult {
+    #[serde(rename = "type")]
+    type_: String,
+    value: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ResponseResult {
+    result: ResponseResultResult,
+    #[serde(rename = "frameId")]
+    frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Response {
+    id: u64,
+    result: ResponseResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct Event {
+    // FIXME
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Message {
+    Response(Response),
+    Event(Event),
+}
+
 struct BrowserShared {
     websocket: WebSocket<TcpStream>,
+    ringbuf: RingBuf<Message>,
 }
 
 pub struct Browser {
     child: Child,
     shared: Arc<Mutex<BrowserShared>>,
     request_id: u64,
-}
-
-struct Response {
-    // FIXME
-}
-
-struct Event {
-    // FIXME
-}
-
-enum Message {
-    Response(Response),
-    Event(Event),
 }
 
 impl Browser {
@@ -126,7 +146,7 @@ impl Browser {
 
         let debugger_url: String;
         {
-            #[derive(Deserialize, Debug)]
+            #[derive(Debug, Deserialize)]
             struct Config {
                 #[serde(rename = "webSocketDebuggerUrl")]
                 debugger_url: String,
@@ -231,6 +251,7 @@ impl Browser {
 
         let shared = Arc::new(Mutex::new(BrowserShared{
             websocket: websocket,
+            ringbuf: RingBuf::<Message>::new(),
         }));
 
         {
@@ -240,10 +261,14 @@ impl Browser {
                     match shared.lock() {
                         Ok(ref mut s) => {
                             match s.websocket.read_message() {
-                                Ok(m) => {
-                                    // FIXME Store messages (responses/events enum) in a circular buffer
-                                    log::info!("websocket message: {}", m);
+                                Ok(tungstenite::protocol::Message::Text(m)) => {
+                                    log::info!("<<< {}", m); // FIXME Change to trace
+                                    match serde_json::from_str::<Message>(&m) {
+                                        Ok(m) => s.ringbuf.push(m),
+                                        Err(e) => log::error!("json deserialization error: {}", e)
+                                    }
                                 },
+                                Ok(_) => log::warn!("received non-text websocket message"),
                                 Err(tungstenite::error::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {},
                                 Err(e) => {
                                     log::error!("websocket error: {}", e);
@@ -271,30 +296,32 @@ impl Browser {
         {
             let mut params: Map<String, Value> = Map::new();
             params.insert("expression".to_string(), Value::String("navigator.userAgent".to_string()));
-            let _ = retval.execute("Runtime.evaluate", Some(params));
+            let r = retval.execute("Runtime.evaluate", Some(params), Some(Duration::from_secs(5)));
+            log::info!("execute: {:?}", r);
         }
 
         Ok(retval)
     }
 
-    // FIXME Include timeout here, including forever and immediate return
-    fn execute(&mut self, method: &str, param: Option<Map<String, Value>>) -> Result<Response, Box<dyn Error>> {
+    fn execute(&mut self, method: &str, params: Option<Map<String, Value>>, timeout: Option<Duration>) -> Result<Response, Box<dyn Error>> {
+        #[derive(Serialize)]
+        struct Request {
+            id: Number,
+            method: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            params: Option<Map<String, Value>>,
+        }
+
+        let request = Request{
+            id: Number::from(self.request_id),
+            method: method.to_string(),
+            params: params,
+        };
+        self.request_id += 1;
+
+        let shared = self.shared.clone();
+
         {
-            #[derive(Serialize)]
-            struct Request {
-                id: Number,
-                method: String,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                param: Option<Map<String, Value>>,
-            }
-
-            let request = Request{
-                id: Number::from(self.request_id),
-                method: method.to_string(),
-                param: param,
-            };
-            self.request_id += 1;
-
             let request_string = match serde_json::to_string(&request) {
                 Ok(s) => s,
                 Err(e) => {
@@ -304,7 +331,7 @@ impl Browser {
             };
             log::trace!(">>> {}", request_string);
 
-            match self.shared.clone().lock() {
+            match shared.lock() {
                 Ok(mut s) => {
                     match s.send_request(&request_string) {
                         Ok(_) => {},
@@ -322,9 +349,38 @@ impl Browser {
             }
         }
 
-        // FIXME STOPPED Loop for optional timeout while thread collects potential responses
+        {
+            let start = Instant::now();
+            loop {
+                if let Some(t) = timeout {
+                    if Instant::now().duration_since(start) > t {
+                        log::error!("browser execute timed out");
+                        return Err(Box::new(io::Error::new(io::ErrorKind::TimedOut, "timed out")));
+                    }
+                }
 
-        Ok(Response {})
+                match shared.lock() {
+                    Ok(s) => {
+                        for message in s.ringbuf.iter() {
+                            if let Message::Response(r) = message {
+                                if let Some(i) = request.id.as_u64() {
+                                    if r.id == i {
+                                        return Ok(r.clone());
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        let s = format!("poisoned mutex: {}", e);
+                        log::error!("{}", s);
+                        return Err(string_error::into_err(s));
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 }
 
@@ -381,6 +437,70 @@ impl BrowserShared {
         match self.websocket.write_message(protocol::Message::Text(request.to_string())) {
             Ok(_) => Ok(()),
             Err(e) => Err(Box::new(e))
+        }
+    }
+}
+
+struct RingBuf<T> {
+    buffer: Vec<T>,
+    write_idx: usize,
+}
+
+struct RingBufIter<'a, T> {
+    ringbuf: &'a RingBuf<T>,
+    stop_idx: usize,
+    read_idx: usize,
+    done: bool,
+}
+
+impl<T> RingBuf<T> {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(1000),
+            write_idx: 0,
+        }
+    }
+
+    fn push(&mut self, value: T) {
+        if self.buffer.len() < self.buffer.capacity() {
+            self.buffer.push(value);
+        } else {
+            self.buffer[self.write_idx] = value;
+            self.write_idx = (self.write_idx + 1) % self.buffer.capacity();
+        }
+    }
+
+    fn iter(&self) -> RingBufIter<T> {
+        let (done, start_idx, stop_idx) = if self.buffer.len() == 0 {
+            (true, 0, 0)
+        } else if self.buffer.len() < self.buffer.capacity() {
+            (false, 0, self.buffer.len())
+        } else {
+            (false, self.write_idx, self.write_idx)
+        };
+
+        RingBufIter{
+            ringbuf: self,
+            stop_idx: stop_idx,
+            read_idx: start_idx,
+            done: done,
+        }
+    }
+}
+
+impl<'a, T> Iterator for RingBufIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            None
+        } else {
+            let retval = Some(&self.ringbuf.buffer[self.read_idx]);
+            self.read_idx = (self.read_idx + 1) % self.ringbuf.buffer.capacity();
+            if self.read_idx == self.stop_idx {
+                self.done = true;
+            }
+            retval
         }
     }
 }
