@@ -34,7 +34,7 @@ struct ResponseResultResult {
 
 #[derive(Clone, Debug, Deserialize)]
 struct ResponseResult {
-    result: ResponseResultResult,
+    result: Option<ResponseResultResult>,
     #[serde(rename = "frameId")]
     frame_id: Option<String>,
 }
@@ -292,12 +292,27 @@ impl Browser {
             request_id: 0,
         };
 
-        // FIXME STOPPED
         {
+            let mut user_agent = match retval.evaluate_string("navigator.userAgent", Some(Duration::from_secs(5))) {
+                Ok(s) => s,
+                Err(e) => {
+                    drop(retval);
+                    return Err(e);
+                }
+            };
+            user_agent = user_agent.replacen("HeadlessChrome", "Chrome", 1);
+
             let mut params: Map<String, Value> = Map::new();
-            params.insert("expression".to_string(), Value::String("navigator.userAgent".to_string()));
-            let r = retval.execute("Runtime.evaluate", Some(params), Some(Duration::from_secs(5)));
-            log::info!("execute: {:?}", r);
+            params.insert("userAgent".to_string(), Value::String(user_agent.to_string()));
+            if let Err(e) = retval.execute("Network.setUserAgentOverride", Some(params), Some(Duration::from_secs(5))) {
+                drop(retval);
+                return Err(e);
+            }
+
+            if let Err(e) = retval.execute("Page.enable", None, Some(Duration::from_secs(5))) {
+                drop(retval);
+                return Err(e);
+            }
         }
 
         Ok(retval)
@@ -354,7 +369,7 @@ impl Browser {
             loop {
                 if let Some(t) = timeout {
                     if Instant::now().duration_since(start) > t {
-                        log::error!("browser execute timed out");
+                        log::error!("execute timed out");
                         return Err(Box::new(io::Error::new(io::ErrorKind::TimedOut, "timed out")));
                     }
                 }
@@ -382,13 +397,38 @@ impl Browser {
             }
         }
     }
+
+    pub fn evaluate_string(&mut self, expr: &str, timeout: Option<Duration>) -> Result<String, Box<dyn Error>> {
+        let mut params: Map<String, Value> = Map::new();
+        params.insert("expression".to_string(), Value::String(expr.to_string()));
+        match self.execute("Runtime.evaluate", Some(params), timeout) {
+            Ok(r) => {
+                if let Some(s) = r.result.result {
+                    if s.type_ == "string" {
+                        Ok(s.value.to_string())
+                    } else {
+                        let s = format!("response result wrong type: {:?}", s.type_);
+                        log::error!("evaluate_string {}", s);
+                        Err(string_error::into_err(s))
+                    }
+                } else {
+                    let s = format!("response missing result: {:?}", r);
+                    log::error!("evaluate_string {}", s);
+                    Err(string_error::into_err(s))
+                }
+            },
+            Err(e) => Err(e)
+        }
+    }
+
+    // TODO Add evalute_number, etc as needed
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
         let mut alive = true;
-        // FIXME Send a close command and test if alive with 15 sec timeout (as below)
-        //       Generalize the test-if-alive code below in an internal function
+        // FIXME STOPPED Send a close command and test if alive with 15 sec timeout (as below)
+        //               Generalize the test-if-alive code below in an internal function
 
         if !alive {
             return;
