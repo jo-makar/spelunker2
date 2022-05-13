@@ -37,6 +37,8 @@ struct ResponseResult {
     result: Option<ResponseResultResult>,
     #[serde(rename = "frameId")]
     frame_id: Option<String>,
+    #[serde(rename = "loaderId")]
+    loader_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -46,8 +48,21 @@ struct Response {
 }
 
 #[derive(Debug, Deserialize)]
+struct EventParamsFrame {
+    id: String,
+    #[serde(rename = "loaderId")]
+    loader_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventParams {
+    frame: EventParamsFrame,
+}
+
+#[derive(Debug, Deserialize)]
 struct Event {
-    // FIXME
+    method: String,
+    params: EventParams,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,10 +90,7 @@ impl Browser {
 
         match env::var("HOME") {
             Ok(h) => { cmd.arg(format!("--user-data-dir={}/.config/google-chrome", h)); },
-            Err(e) => {
-                log::error!("error to determining HOME: {}", e);
-                return Err(Box::new(e));
-            }
+            Err(e) => return Err(Box::new(e))
         }
 
         cmd.stdin(Stdio::null())
@@ -87,10 +99,7 @@ impl Browser {
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => {
-                log::error!("error launching chrome: {}", e);
-                return Err(Box::new(e));
-            }
+            Err(e) => return Err(Box::new(e))
         };
 
         let stderr = child.stderr.take().unwrap();
@@ -136,10 +145,8 @@ impl Browser {
             }
 
             if let None = port {
-                let s = "websocket url not found";
-                log::error!("{}", s);
                 let _ = child.kill();
-                return Err(string_error::static_err(s));
+                return Err(string_error::static_err("websocket url not found"));
             }
         }
         let port = port.unwrap();
@@ -159,27 +166,21 @@ impl Browser {
                             debugger_url = c[0].debugger_url.clone();
                             log::info!("debugger url: {}", debugger_url);
                         },
-                        Ok(c) => {
-                            let s = format!("unexpected json url response config count ({})", c.len());
-                            log::error!("{}", s);
+                        Ok(_) => {
                             let _ = child.kill();
-                            return Err(string_error::into_err(s));
+                            return Err(string_error::static_err("unexpected json url response config count"));
                         },
                         Err(e) => {
-                            log::error!("error parsing json url response: {}", e);
                             let _ = child.kill();
                             return Err(Box::new(e));
                         }
                     }
                 },
                 Ok(r) => {
-                    let s = format!("{} status from json url", r.status());
-                    log::error!("{}", s);
                     let _ = child.kill();
-                    return Err(string_error::into_err(s));
+                    return Err(string_error::into_err(format!("{} status from json url", r.status())));
                 },
                 Err(e) => {
-                    log::error!("error accessing json url: {}", e);
                     let _ = child.kill();
                     return Err(Box::new(e));
                 }
@@ -211,7 +212,6 @@ impl Browser {
             let port = match Url::parse(&debugger_url) {
                 Ok(u) => u.port().unwrap_or(80),
                 Err(e) => {
-                    log::error!("error parsing debbuger url: {}", e);
                     let _ = child.kill();
                     return Err(Box::new(e));
                 }
@@ -220,7 +220,6 @@ impl Browser {
             stream = match TcpStream::connect(format!("127.0.0.1:{}", port)) {
                 Ok(s) => s,
                 Err(e) => {
-                    log::error!("error connecting to debbuger url: {}", e);
                     let _ = child.kill();
                     return Err(Box::new(e));
                 }
@@ -231,20 +230,16 @@ impl Browser {
         match tungstenite::client::client(debugger_url, stream) {
             Ok((w, r)) if r.status() == StatusCode::SWITCHING_PROTOCOLS => websocket = w,
             Ok((_, r)) => {
-                let s = format!("{} status from debugger url", r.status());
-                log::error!("{}", s);
                 let _ = child.kill();
-                return Err(string_error::into_err(s));
+                return Err(string_error::into_err(format!("{} status from debugger url", r.status())));
             },
             Err(e) => {
-                log::error!("error connecting to websocket: {}", e);
                 let _ = child.kill();
                 return Err(Box::new(e));
             }
         }
 
         if let Err(e) = websocket.get_mut().set_nonblocking(true) {
-            log::error!("set_nonblocking error: {}", e);
             let _ = child.kill();
             return Err(Box::new(e));
         }
@@ -262,14 +257,19 @@ impl Browser {
                         Ok(ref mut s) => {
                             match s.websocket.read_message() {
                                 Ok(tungstenite::protocol::Message::Text(m)) => {
-                                    log::info!("<<< {}", m); // FIXME Change to trace
+                                    log::trace!("<<< {}", m);
                                     match serde_json::from_str::<Message>(&m) {
                                         Ok(m) => s.ringbuf.push(m),
-                                        Err(e) => log::error!("json deserialization error: {}", e)
+                                        Err(_e) => {
+                                            // Only a single event format is defined by Message::Event enum.
+                                            // Add more (ideally all possible) for thie error message to be useful.
+                                            // log::error!("json deserialization error: {:?}", _e);
+                                        }
                                     }
                                 },
                                 Ok(_) => log::warn!("received non-text websocket message"),
                                 Err(tungstenite::error::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {},
+                                Err(tungstenite::error::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => break,
                                 Err(e) => {
                                     log::error!("websocket error: {}", e);
                                     break;
@@ -339,10 +339,7 @@ impl Browser {
         {
             let request_string = match serde_json::to_string(&request) {
                 Ok(s) => s,
-                Err(e) => {
-                    log::error!("json serialization error: {}", e);
-                    return Err(Box::new(e));
-                }
+                Err(e) => return Err(Box::new(e))
             };
             log::trace!(">>> {}", request_string);
 
@@ -350,17 +347,10 @@ impl Browser {
                 Ok(mut s) => {
                     match s.send_request(&request_string) {
                         Ok(_) => {},
-                        Err(e) => {
-                            log::error!("error sending message: {}", e);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e)
                     }
                 },
-                Err(e) => {
-                    let s = format!("poisoned mutex: {}", e);
-                    log::error!("{}", s);
-                    return Err(string_error::into_err(s));
-                }
+                Err(e) => return Err(string_error::into_err(format!("poisoned mutex: {}", e)))
             }
         }
 
@@ -369,7 +359,6 @@ impl Browser {
             loop {
                 if let Some(t) = timeout {
                     if Instant::now().duration_since(start) > t {
-                        log::error!("execute timed out");
                         return Err(Box::new(io::Error::new(io::ErrorKind::TimedOut, "timed out")));
                     }
                 }
@@ -386,11 +375,7 @@ impl Browser {
                             }
                         }
                     },
-                    Err(e) => {
-                        let s = format!("poisoned mutex: {}", e);
-                        log::error!("{}", s);
-                        return Err(string_error::into_err(s));
-                    }
+                    Err(e) => return Err(string_error::into_err(format!("poisoned mutex: {}", e)))
                 }
 
                 thread::sleep(Duration::from_millis(100));
@@ -407,28 +392,105 @@ impl Browser {
                     if s.type_ == "string" {
                         Ok(s.value.to_string())
                     } else {
-                        let s = format!("response result wrong type: {:?}", s.type_);
-                        log::error!("evaluate_string {}", s);
-                        Err(string_error::into_err(s))
+                        Err(string_error::into_err(format!("response result wrong type: {:?}", s.type_)))
                     }
                 } else {
-                    let s = format!("response missing result: {:?}", r);
-                    log::error!("evaluate_string {}", s);
-                    Err(string_error::into_err(s))
+                    Err(string_error::into_err(format!("response missing result: {:?}", r)))
                 }
             },
             Err(e) => Err(e)
         }
     }
 
-    // TODO Add evalute_number, etc as needed
+    pub fn goto(&mut self, url: &str, timeout: Option<Duration>, referrer: Option<&str>) -> Result<(), Box<dyn Error>> {
+        let mut params: Map<String, Value> = Map::new();
+        params.insert("url".to_string(), Value::String(url.to_string()));
+        if let Some(r) = referrer {
+            params.insert("referrer".to_string(), Value::String(r.to_string()));
+        }
+
+        let (frame_id, loader_id): (String, String);
+        match self.execute("Page.navigate", Some(params), Some(Duration::from_secs(5))) {
+            Ok(r) => {
+                if let Some(s) = r.result.frame_id {
+                    frame_id = s;
+                } else {
+                    return Err(string_error::static_err("response result missing frame_id"));
+                }
+                if let Some(s) = r.result.loader_id {
+                    loader_id = s;
+                } else {
+                    return Err(string_error::static_err("response result missing loader_id"));
+                }
+            },
+            Err(e) => return Err(e)
+        }
+
+        let shared = self.shared.clone();
+        {
+            let start = Instant::now();
+            loop {
+                if let Some(t) = timeout {
+                    if Instant::now().duration_since(start) > t {
+                        return Err(Box::new(io::Error::new(io::ErrorKind::TimedOut, "timed out")));
+                    }
+                }
+
+                match shared.lock() {
+                    Ok(s) => {
+                        for message in s.ringbuf.iter() {
+                            if let Message::Event(e) = message {
+                                if e.method == "Page.frameNavigated" && e.params.frame.id == frame_id && e.params.frame.loader_id == loader_id {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => return Err(string_error::into_err(format!("poisoned mutex: {}", e)))
+                }
+
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
+        match self.execute("Browser.close", None, Some(Duration::from_secs(0))) {
+            Ok(_) => {},
+            Err(e) => {
+                if let Some(f) = e.downcast_ref::<io::Error>() {
+                    if f.kind() != io::ErrorKind::TimedOut {
+                        log::error!("Browser.close error: {}", f);
+                    }
+                } else {
+                    log::error!("Browser.close error: {}", e);
+                }
+            }
+        }
+
         let mut alive = true;
-        // FIXME STOPPED Send a close command and test if alive with 15 sec timeout (as below)
-        //               Generalize the test-if-alive code below in an internal function
+        let start = Instant::now();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    alive = false;
+                    break;
+                },
+                Ok(None) => {},
+                Err(e) => {
+                    log::error!("process try_wait error: {}", e);
+                    break;
+                }
+            }
+
+            if Instant::now().duration_since(start) > Duration::from_secs(15) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
 
         if !alive {
             return;
@@ -545,4 +607,7 @@ impl<'a, T> Iterator for RingBufIter<'a, T> {
     }
 }
 
+// TODO Add Browser.new_incognito()
+// TODO Add Browser.evalute_number(), etc as needed
+//      Also consider adding Browser.evaluate (no return type) and replace use of execute() in new()
 // TODO Add support for thread-safe, simultaneous sessions
